@@ -120,7 +120,7 @@ export async function execute(
 			side: side as OrderSide_LT,
 			type: 'LIMIT',
 			timeInForce: 'GTC',
-			reduceOnly: reduceOnly,
+			reduceOnly: reduceOnly ? 'true' : 'false',
 		});
 		// For LIMIT, binance may not provide avgPrice until filled — we will not attempt TP/SL here
 		// unless you want behavior: create conditional orders immediately using price param.
