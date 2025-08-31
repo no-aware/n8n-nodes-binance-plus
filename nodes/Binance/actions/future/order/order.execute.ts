@@ -1,9 +1,48 @@
 import { IExecuteFunctions } from 'n8n-core';
 import { INodeExecutionData } from 'n8n-workflow';
 import createBinance, { OrderSide_LT } from 'binance-api-node';
+import WebSocket from 'ws';
 
 function sleep(ms: number) {
 	return new Promise((res) => setTimeout(res, ms));
+}
+
+// Интерфейс для события исполнения ордера
+interface ExecutionReport {
+	e: string; // event type
+	E: number; // event time
+	s: string; // symbol
+	c: string; // client order id
+	S: string; // side
+	o: string; // order type
+	f: string; // time in force
+	q: string; // order quantity
+	p: string; // order price
+	P: string; // stop price
+	F: string; // iceberg quantity
+	g: number; // order list id
+	C: string; // original client order id
+	x: string; // current execution type
+	X: string; // current order status
+	r: string; // order reject reason
+	i: number; // order id
+	l: string; // last executed quantity
+	z: string; // cumulative filled quantity
+	L: string; // last executed price
+	n: string; // commission amount
+	N: string; // commission asset
+	T: number; // transaction time
+	t: number; // trade id
+	I: number; // ignore this
+	w: boolean; // is the order on the book?
+	m: boolean; // is this trade the maker side?
+	M: boolean; // ignore this
+	O: number; // order creation time
+	Z: string; // cumulative quote asset transacted
+	Y: string; // last quote asset transacted
+	Q: string; // quote order quantity
+	W: number; // working time
+	V: number; // self trade prevention mode
 }
 
 export async function execute(
@@ -62,45 +101,87 @@ export async function execute(
 			type: 'MARKET',
 		});
 
-		// try to obtain entry price (avgPrice) and executed qty; fallback polling if 0
-		let entryPrice: number | undefined =
-			marketOrder && (marketOrder.avgPrice ? Number(marketOrder.avgPrice) : undefined);
+		// Получаем listenKey для WebSocket
+		const { listenKey } = await binanceClient.futuresGetDataStream();
+		
+		// Создаем WebSocket соединение
+		const ws = new WebSocket(`wss://fstream.binance.com/ws/${listenKey}`);
+		
+		// Создаем промис для ожидания исполнения ордера
+		const executionPromise = new Promise<{ avgPrice: number; executedQty: number }>((resolve, reject) => {
+			const timeout = setTimeout(() => {
+				ws.close();
+				reject(new Error('Timeout waiting for order execution'));
+			}, 10000); // 10 секунд таймаут
 
-		let entryQty: number | undefined =
-			marketOrder && marketOrder.executedQty ? Number(marketOrder.executedQty) : undefined;
-
-		if ((!entryPrice || entryPrice === 0) && marketOrder && marketOrder.orderId) {
-			const maxAttempts = 5;
-			for (let attempt = 0; attempt < maxAttempts; attempt++) {
-				await sleep(500);
+			ws.on('message', (data: Buffer) => {
 				try {
-					// some binance client libs support fetching order by orderId
-					// this call may throw on some versions — wrap in try/catch
-					const ord = await binanceClient.futuresOrder({
-						symbol,
-						orderId: marketOrder.orderId,
-					} as any);
-					if (ord) {
-						if (ord.avgPrice && Number(ord.avgPrice) > 0) {
-							entryPrice = Number(ord.avgPrice);
-						}
-						if (ord.executedQty) {
-							entryQty = Number(ord.executedQty);
-						}
+					const message: ExecutionReport = JSON.parse(data.toString());
+					
+					if (message.e === 'executionReport' && 
+						message.X === 'FILLED' && 
+						message.i === marketOrder.orderId) {
+						
+						clearTimeout(timeout);
+						ws.close();
+						
+						resolve({
+							avgPrice: parseFloat(message.L), // Last executed price
+							executedQty: parseFloat(message.l) // Last executed quantity
+						});
 					}
-					if (entryPrice && entryPrice > 0) break;
-				} catch (e) {
-					// ignore and retry
+				} catch (error) {
+					// Игнорируем ошибки парсинга
+				}
+			});
+
+			ws.on('error', (error) => {
+				clearTimeout(timeout);
+				reject(error);
+			});
+		});
+
+		// try to obtain entry price (avgPrice) and executed qty
+		let entryPrice: number | undefined;
+		let entryQty: number | undefined;
+
+		try {
+			// Ждем исполнения ордера через WebSocket
+			const executionData = await executionPromise;
+			entryPrice = executionData.avgPrice;
+			entryQty = executionData.executedQty;
+		} catch (error) {
+			// Fallback на polling метод если WebSocket не сработал
+			console.error('WebSocket failed, using polling fallback:', error);
+			
+			// Используем существующий polling метод как fallback
+			if (marketOrder && marketOrder.orderId) {
+				const maxAttempts = 10;
+				for (let attempt = 0; attempt < maxAttempts; attempt++) {
+					await sleep(1000);
+					try {
+						const ord = await binanceClient.futuresOrder({
+							symbol,
+							orderId: marketOrder.orderId,
+						} as any);
+						if (ord) {
+							if (ord.avgPrice && Number(ord.avgPrice) > 0) {
+								entryPrice = Number(ord.avgPrice);
+							}
+							if (ord.executedQty) {
+								entryQty = Number(ord.executedQty);
+							}
+						}
+						if (entryPrice && entryPrice > 0) break;
+					} catch (e) {
+						// ignore and retry
+					}
 				}
 			}
 		}
 
 		// if still no price, we won't create TP/SL to avoid wrong levels
 		if (!entryPrice || entryPrice === 0) {
-			// fallback: try last trade price (less accurate) — optional, commented out
-			// const trades = await binanceClient.futuresTrades({ symbol, limit: 1 });
-			// if (trades && trades.length) entryPrice = Number(trades[0].price);
-
 			// Return a warning-contained response but keep market order info
 			return this.helpers.returnJsonArray([
 				{
@@ -123,8 +204,6 @@ export async function execute(
 			reduceOnly: reduceOnly ? 'true' : 'false',
 		});
 		// For LIMIT, binance may not provide avgPrice until filled — we will not attempt TP/SL here
-		// unless you want behavior: create conditional orders immediately using price param.
-		// For minimal change, we skip auto-TP/SL for LIMIT in this implementation.
 	}
 
 	// If we have an entry price and TP/SL requested — create conditional orders
