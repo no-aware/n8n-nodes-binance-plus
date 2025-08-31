@@ -102,7 +102,7 @@ export async function execute(
 		});
 
 		// Получаем listenKey для WebSocket
-		const { listenKey } = await binanceClient.futuresGetListenKey();
+		const { listenKey } = await (binanceClient as any).futuresGetListenKey();
 		
 		// Создаем WebSocket соединение
 		const ws = new WebSocket(`wss://fstream.binance.com/ws/${listenKey}`);
