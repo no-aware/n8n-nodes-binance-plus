@@ -127,7 +127,7 @@ export async function execute(
 						
 						resolve({
 							avgPrice: parseFloat(message.L), // Last executed price
-							executedQty: parseFloat(message.l) // Last executed quantity
+							executedQty: parseFloat(message.l), // Last executed quantity
 						});
 					}
 				} catch (error) {
