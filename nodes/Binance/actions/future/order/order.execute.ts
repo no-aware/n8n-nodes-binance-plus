@@ -75,7 +75,7 @@ export async function execute(
 	// only read price when orderType is LIMIT (price field may be hidden for MARKET and cause an error)
 	let price: any = undefined;
 	if (orderType === 'LIMIT') {
-		price = this.getNodeParameter('price', index) as any;
+		price = this.getNodeParameter('price', index) as any);
 	}
 	const reduceOnly = this.getNodeParameter('reduceOnly', index) as boolean;
 
@@ -234,16 +234,20 @@ export async function execute(
 							symbol,
 							orderId: marketOrder.orderId,
 						} as any);
-						if (ord) {
+						
+						// Исправление: используем any для обхода проверки типов
+						const ordAny = ord as any;
+						
+						if (ordAny) {
 							// binance-api-node может возвращать avgPrice или fills
-							if (ord.avgPrice && Number(ord.avgPrice) > 0) {
-								entryPrice = Number(ord.avgPrice);
-							} else if (ord.fills && ord.fills.length) {
+							if (ordAny.avgPrice && Number(ordAny.avgPrice) > 0) {
+								entryPrice = Number(ordAny.avgPrice);
+							} else if (ordAny.fills && ordAny.fills.length) {
 								// взять среднюю цену или первую заполненную цену
-								entryPrice = Number(ord.fills[0].price);
+								entryPrice = Number(ordAny.fills[0].price);
 							}
-							if (ord.executedQty) {
-								entryQty = Number(ord.executedQty);
+							if (ordAny.executedQty) {
+								entryQty = Number(ordAny.executedQty);
 							}
 						}
 						if (entryPrice && entryPrice > 0) break;
@@ -288,7 +292,7 @@ export async function execute(
 	// If we have an entry price and TP/SL requested — create conditional orders
 	const entryPriceResolved =
 		(marketOrder && (marketOrder._entryPrice || marketOrder.avgPrice)) ||
-		(marketOrder && marketOrder.fills && marketOrder.fills.length ? marketOrder.fills[0].price : undefined);
+		(marketOrder && (marketOrder as any).fills && (marketOrder as any).fills.length ? (marketOrder as any).fills[0].price : undefined);
 
 	let entryPriceNum: number | undefined = undefined;
 	if (entryPriceResolved) {
