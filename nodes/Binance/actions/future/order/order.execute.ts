@@ -2,6 +2,7 @@ import { IExecuteFunctions } from 'n8n-core';
 import { INodeExecutionData } from 'n8n-workflow';
 import createBinance, { OrderSide_LT } from 'binance-api-node';
 import WebSocket from 'ws';
+import axios from 'axios';
 
 function sleep(ms: number) {
 	return new Promise((res) => setTimeout(res, ms));
@@ -91,6 +92,21 @@ export async function execute(
 	let stopLossOrder: any = null;
 	let autoOcoResult: any = { status: 'not_enabled' };
 
+	// helper: get futures listenKey via REST (fapi)
+	async function getFuturesListenKey(apiKey: string) {
+		try {
+			const res = await axios.post('https://fapi.binance.com/fapi/v1/listenKey', null, {
+				headers: { 'X-MBX-APIKEY': apiKey },
+			});
+			if (res && res.data && res.data.listenKey) {
+				return res.data.listenKey as string;
+			}
+			throw new Error('No listenKey in response');
+		} catch (err: any) {
+			throw new Error(`Failed to get futures listenKey: ${err?.message ?? String(err)}`);
+		}
+	}
+
 	// create market or limit order
 	if (orderType === 'MARKET') {
 		// create MARKET order
@@ -101,45 +117,99 @@ export async function execute(
 			type: 'MARKET',
 		});
 
-		// Получаем listenKey для WebSocket
-		const { listenKey } = await (binanceClient as any).futuresGetListenKey();
-		
-		// Создаем WebSocket соединение
-		const ws = new WebSocket(`wss://fstream.binance.com/ws/${listenKey}`);
-		
-		// Создаем промис для ожидания исполнения ордера
-		const executionPromise = new Promise<{ avgPrice: number; executedQty: number }>((resolve, reject) => {
-			const timeout = setTimeout(() => {
-				ws.close();
-				reject(new Error('Timeout waiting for order execution'));
-			}, 10000); // 10 секунд таймаут
+		// Если не получили orderId — продолжать бесполезно
+		if (!marketOrder || (marketOrder && !('orderId' in marketOrder))) {
+			return this.helpers.returnJsonArray([
+				{
+					json: {
+						error: 'Market order created but no orderId returned',
+						marketOrder,
+					},
+				},
+			]);
+		}
 
-			ws.on('message', (data: Buffer) => {
-				try {
-					const message: ExecutionReport = JSON.parse(data.toString());
-					
-					if (message.e === 'executionReport' && 
-						message.X === 'FILLED' && 
-						message.i === marketOrder.orderId) {
-						
-						clearTimeout(timeout);
+		// Получаем listenKey через REST (не полагаемся на SDK)
+		const apiKey =
+			(credentials as any)?.apiKey ||
+			(credentials as any)?.APIKey ||
+			(credentials as any)?.key ||
+			(credentials as any)?.accessKey;
+		if (!apiKey) {
+			// Если нет ключа в credentials — возвращаем ошибку
+			return this.helpers.returnJsonArray([
+				{
+					json: {
+						error: 'API key not found in credentials — needed to create futures listenKey.',
+						marketOrder,
+					},
+				},
+			]);
+		}
+
+		let listenKey: string | undefined;
+		try {
+			listenKey = await getFuturesListenKey(apiKey);
+		} catch (err: any) {
+			// Если не получилось получить listenKey — fallback к polling
+			console.error('Failed to obtain listenKey, will fallback to polling:', err?.message ?? err);
+			listenKey = undefined;
+		}
+
+		// Создаем WebSocket только если получили listenKey
+		let executionPromise: Promise<{ avgPrice: number; executedQty: number }>;
+		if (listenKey) {
+			const ws = new WebSocket(`wss://fstream.binance.com/ws/${listenKey}`);
+
+			executionPromise = new Promise<{ avgPrice: number; executedQty: number }>((resolve, reject) => {
+				const timeout = setTimeout(() => {
+					try {
 						ws.close();
-						
-						resolve({
-							avgPrice: parseFloat(message.L), // Last executed price
-							executedQty: parseFloat(message.l), // Last executed quantity
-						});
+					} catch (e) {
+						/* ignore */
 					}
-				} catch (error) {
-					// Игнорируем ошибки парсинга
-				}
-			});
+					reject(new Error('Timeout waiting for order execution'));
+				}, 10000); // 10 секунд таймаут
 
-			ws.on('error', (error) => {
-				clearTimeout(timeout);
-				reject(error);
+				ws.on('message', (data: Buffer | string) => {
+					try {
+						const msg = typeof data === 'string' ? data : data.toString();
+						const message: ExecutionReport = JSON.parse(msg);
+
+						// Сравниваем orderId как строки (безопасно)
+						if (
+							message.e === 'executionReport' &&
+							message.X === 'FILLED' &&
+							String(message.i) === String(marketOrder.orderId)
+						) {
+							clearTimeout(timeout);
+							try {
+								ws.close();
+							} catch (e) {
+								/* ignore */
+							}
+							resolve({
+								avgPrice: parseFloat(message.L || '0'),
+								executedQty: parseFloat(message.l || '0'),
+							});
+						}
+					} catch (error) {
+						// Игнорируем ошибки парсинга
+					}
+				});
+
+				ws.on('error', (error) => {
+					reject(error);
+				});
+
+				ws.on('open', () => {
+					// ничего дополнительно не посылаем — это user data stream
+				});
 			});
-		});
+		} else {
+			// Если listenKey не получили — сразу reject promise, чтобы перейти на polling fallback
+			executionPromise = Promise.reject(new Error('No listenKey available'));
+		}
 
 		// try to obtain entry price (avgPrice) and executed qty
 		let entryPrice: number | undefined;
@@ -152,8 +222,8 @@ export async function execute(
 			entryQty = executionData.executedQty;
 		} catch (error) {
 			// Fallback на polling метод если WebSocket не сработал
-			console.error('WebSocket failed, using polling fallback:', error);
-			
+			console.error('WebSocket failed or not available, using polling fallback:', error);
+
 			// Используем существующий polling метод как fallback
 			if (marketOrder && marketOrder.orderId) {
 				const maxAttempts = 10;
@@ -165,8 +235,12 @@ export async function execute(
 							orderId: marketOrder.orderId,
 						} as any);
 						if (ord) {
+							// binance-api-node может возвращать avgPrice или fills
 							if (ord.avgPrice && Number(ord.avgPrice) > 0) {
 								entryPrice = Number(ord.avgPrice);
+							} else if (ord.fills && ord.fills.length) {
+								// взять среднюю цену или первую заполненную цену
+								entryPrice = Number(ord.fills[0].price);
 							}
 							if (ord.executedQty) {
 								entryQty = Number(ord.executedQty);
@@ -192,6 +266,11 @@ export async function execute(
 				},
 			]);
 		}
+
+		// Normalize entry price for later use
+		// (we'll use entryPriceNum below)
+		marketOrder._entryPrice = entryPrice;
+		marketOrder._entryQty = entryQty;
 	} else {
 		// LIMIT (existing behaviour) — price is read above only when orderType === 'LIMIT'
 		marketOrder = await binanceClient.futuresOrder({
@@ -208,9 +287,8 @@ export async function execute(
 
 	// If we have an entry price and TP/SL requested — create conditional orders
 	const entryPriceResolved =
-		marketOrder &&
-		(marketOrder.avgPrice ||
-			(marketOrder.fills && marketOrder.fills.length ? marketOrder.fills[0].price : undefined));
+		(marketOrder && (marketOrder._entryPrice || marketOrder.avgPrice)) ||
+		(marketOrder && marketOrder.fills && marketOrder.fills.length ? marketOrder.fills[0].price : undefined);
 
 	let entryPriceNum: number | undefined = undefined;
 	if (entryPriceResolved) {
@@ -224,14 +302,10 @@ export async function execute(
 		let slPrice: number | undefined = undefined;
 
 		if (tpPercent > 0) {
-			tpPrice = isBuy
-				? entryPriceNum * (1 + tpPercent / 100)
-				: entryPriceNum * (1 - tpPercent / 100);
+			tpPrice = isBuy ? entryPriceNum * (1 + tpPercent / 100) : entryPriceNum * (1 - tpPercent / 100);
 		}
 		if (slPercent > 0) {
-			slPrice = isBuy
-				? entryPriceNum * (1 - slPercent / 100)
-				: entryPriceNum * (1 + slPercent / 100);
+			slPrice = isBuy ? entryPriceNum * (1 - slPercent / 100) : entryPriceNum * (1 + slPercent / 100);
 		}
 
 		const oppositeSide = isBuy ? 'SELL' : 'BUY';
@@ -273,11 +347,9 @@ export async function execute(
 		if (autoOco && (takeProfitOrder || stopLossOrder)) {
 			const start = Date.now();
 			const tpId =
-				takeProfitOrder &&
-				(takeProfitOrder.orderId || takeProfitOrder.clientOrderId || takeProfitOrder.orderId);
+				takeProfitOrder && (takeProfitOrder.orderId || takeProfitOrder.clientOrderId || takeProfitOrder.orderId);
 			const slId =
-				stopLossOrder &&
-				(stopLossOrder.orderId || stopLossOrder.clientOrderId || stopLossOrder.orderId);
+				stopLossOrder && (stopLossOrder.orderId || stopLossOrder.clientOrderId || stopLossOrder.orderId);
 			let otherToCancel: any = null;
 			let handled = false;
 
