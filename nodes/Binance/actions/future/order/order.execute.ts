@@ -75,7 +75,7 @@ export async function execute(
 	// only read price when orderType is LIMIT (price field may be hidden for MARKET and cause an error)
 	let price: any = undefined;
 	if (orderType === 'LIMIT') {
-		price = this.getNodeParameter('price', index) as any);
+		price = this.getNodeParameter('price', index) as any;
 	}
 	const reduceOnly = this.getNodeParameter('reduceOnly', index) as boolean;
 
